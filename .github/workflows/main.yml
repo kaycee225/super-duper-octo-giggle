@@ -1,0 +1,358 @@
+name: Download and Upload Pipeline
+
+on:
+  push:
+    branches:
+      - main
+jobs:
+  download_and_upload:
+    runs-on: ubuntu-latest
+    
+    env:
+      FILEMIRAGE_API_TOKEN: '9QQH-DGES-CWQZ-FXNV'
+      FOLDER_PATH: 'downloaded_files'
+      LINK_FETCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/e1299469-9f8b-45ad-972d-77cc13f1e0c4.txt'
+      KILL_SWITCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/e1299469-9f8b-45ad-972d-77cc13f1e0c4.txt'
+
+    steps:
+      - name: Git Clone / Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          #!/usr/bin/env bash
+          set -e
+          sudo apt update && sudo apt install transmission-daemon transmission-cli jq curl zip p7zip-full python3 python3-requests -y
+
+      - name: Download torrent content with Transmission & Dynamic Link Sync
+        run: |
+          #!/usr/bin/env bash
+          set -e
+          mkdir -p "$FOLDER_PATH"
+          touch added_links.txt
+          
+          # Stop the default daemon service if it auto-started
+          sudo systemctl stop transmission-daemon || true
+          
+          # Configure and start transmission-daemon in the background
+          mkdir -p ~/.config/transmission-daemon
+          transmission-daemon -g ~/.config/transmission-daemon -T -w "$PWD/$FOLDER_PATH"
+          sleep 5
+
+          echo "Starting download loop with live progress, 10s silent kill switch checks, and dynamic link fetching..."
+
+          while true; do
+            # 1. Silent Kill Switch Check (Every 10 seconds)
+            if [ -n "$KILL_SWITCH_URL" ]; then
+              KILL_STATUS=$(curl -s "$KILL_SWITCH_URL" || echo "")
+              
+              # Global Kill Switch
+              if echo "$KILL_STATUS" | grep -q "STOP.ALL.TORRENTS"; then
+                echo "🛑 Kill switch activated! 'STOP.ALL.TORRENTS' detected."
+                echo "Stopping downloads and proceeding with currently downloaded files..."
+                break
+              fi
+
+              # Specific Torrent Kill Switch
+              echo "$KILL_STATUS" | grep " NO$" > current_kill_list.txt || true
+              if [ -s current_kill_list.txt ]; then
+                python3 - << 'EOF'
+          import requests
+          try:
+              url = 'http://127.0.0.1:9091/transmission/rpc'
+              sid = requests.post(url).headers.get('X-Transmission-Session-Id')
+              headers = {'X-Transmission-Session-Id': sid}
+              
+              # Fetch all active torrents
+              payload = {'method': 'torrent-get', 'arguments': {'fields': ['id', 'name']}}
+              torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
+              
+              with open('current_kill_list.txt', 'r') as f:
+                  targets = [line.replace(' NO', '').strip().lower() for line in f if line.strip()]
+              
+              for t in torrents:
+                  name_lower = t['name'].lower()
+                  for target in targets:
+                      if target and target in name_lower:
+                          print(f"🛑 Specific kill switch activated for target: {t['name']}")
+                          requests.post(url, headers=headers, json={
+                              'method': 'torrent-remove',
+                              'arguments': {'ids': [t['id']], 'delete-local-data': True}
+                          })
+          except Exception as e:
+              print("Kill switch check error:", e)
+          EOF
+              fi
+            fi
+
+            # 2. Dynamic Remote Link Fetch & Add (Every 10 seconds)
+            if [ -n "$LINK_FETCH_URL" ]; then
+              curl -s -o page.txt "$LINK_FETCH_URL" || true
+
+              if [ -f page.txt ]; then
+                while IFS= read -r link || [ -n "$link" ]; do
+                  link=$(echo "$link" | tr -d '\r')
+                  if [ -n "$link" ] && [[ ! "$link" =~ ^# ]]; then
+                    if ! grep -qxF "$link" added_links.txt 2>/dev/null; then
+                      echo "📥 New magnet link detected! Adding: $link"
+                      transmission-remote -a "$link"
+                      echo "$link" >> added_links.txt
+                    fi
+                  fi
+                done < page.txt
+              fi
+            fi
+
+            # 3. Fetch Torrent Status & Report Progress via Python (Transmission RPC)
+            ALL_DONE=$(python3 - << 'EOF'
+          import requests
+          try:
+              url = 'http://127.0.0.1:9091/transmission/rpc'
+              sid = requests.post(url).headers.get('X-Transmission-Session-Id')
+              headers = {'X-Transmission-Session-Id': sid}
+              
+              payload = {'method': 'torrent-get', 'arguments': {'fields': ['name', 'percentDone', 'status']}}
+              torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
+              
+              if not torrents:
+                  print("WAITING")
+              else:
+                  incomplete = 0
+                  for t in torrents:
+                      progress = int(t['percentDone'] * 100)
+                      print(f"📥 Torrent: {t['name']} | Progress: {progress}%")
+                      if progress < 100:
+                          incomplete += 1
+                  if incomplete == 0:
+                      print("ALL_COMPLETE")
+          except Exception as e:
+              pass
+          EOF
+            )
+
+            # Print statuses ignoring internal script flags
+            echo "$ALL_DONE" | grep -v "ALL_COMPLETE" | grep -v "WAITING" || true
+
+            if echo "$ALL_DONE" | grep -q "ALL_COMPLETE"; then
+              echo "✅ All active downloads completed naturally!"
+              break
+            elif echo "$ALL_DONE" | grep -q "WAITING"; then
+              echo "Waiting for active torrents..."
+            fi
+
+            sleep 10
+          done
+
+          # Purge incomplete downloads (< 100%)
+          python3 - << 'EOF'
+          import requests, os, shutil
+          try:
+              url = 'http://127.0.0.1:9091/transmission/rpc'
+              sid = requests.post(url).headers.get('X-Transmission-Session-Id')
+              headers = {'X-Transmission-Session-Id': sid}
+              
+              payload = {'method': 'torrent-get', 'arguments': {'fields': ['id', 'name', 'percentDone', 'downloadDir']}}
+              torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
+              
+              for t in torrents:
+                  name = t.get('name', 'Unknown')
+                  progress = t.get('percentDone', 0.0)
+                  print(f"Checking final status -> '{name}': {progress * 100:.1f}%")
+                  
+                  if progress < 1.0:
+                      content_path = os.path.join(t.get('downloadDir', ''), name)
+                      print(f"❌ Skipping & deleting incomplete download (< 100%): {content_path}")
+                      
+                      requests.post(url, headers=headers, json={
+                          'method': 'torrent-remove',
+                          'arguments': {'ids': [t['id']], 'delete-local-data': True}
+                      })
+                      
+                      if os.path.exists(content_path):
+                          if os.path.isdir(content_path):
+                              shutil.rmtree(content_path, ignore_errors=True)
+                          else:
+                              os.remove(content_path)
+          except Exception as e:
+              print(f"Error filtering incomplete torrents: {e}")
+          EOF
+
+          find "$PWD/$FOLDER_PATH" -type f -name "*.part" -delete
+          find "$PWD/$FOLDER_PATH" -type d -name ".unwanted" -exec rm -rf {} + || true
+
+          killall transmission-daemon || true
+          sleep 2
+
+      - name: Smart Native Zipping & Splitting (7-Zip Store Mode)
+        run: |
+          python3 - << 'EOF'
+          import os
+          import shutil
+          import subprocess
+          import re
+          from collections import defaultdict
+
+          root_dir = "downloaded_files"
+          if not os.path.exists(root_dir):
+              os.makedirs(root_dir)
+
+          video_extensions = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
+          subtitle_extensions = ('.srt', '.ass', '.vtt', '.sub')
+          media_extensions = video_extensions + subtitle_extensions
+
+          MAX_SIZE_BYTES = 7000 * 1024 * 1024  # 7 GB limit
+
+          def get_dir_size(path):
+              return sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(path) for f in fn if not os.path.islink(os.path.join(dp, f)))
+
+          def get_video_files(directory):
+              return sorted([os.path.join(dp, f) for dp, dn, fn in os.walk(directory) for f in fn if f.lower().endswith(video_extensions)])
+
+          def get_media_files(directory):
+              return sorted([os.path.join(dp, f) for dp, dn, fn in os.walk(directory) for f in fn if f.lower().endswith(media_extensions)])
+
+          def get_series_name(filename):
+              match = re.search(r'(?i)^(.*?)(?:[\. _]?(?:s\d{1,2}e\d{1,2}|\d{1,2}x\d{1,2}|e\d{1,3}|ep\s?\d{1,3}|-\s\d{1,3}))', filename)
+              if match:
+                  name = match.group(1).strip('. -_')
+                  if name: return name
+              
+              name_no_ext = os.path.splitext(filename)[0]
+              match = re.search(r'^(.*?)(?:\s*\d+)$', name_no_ext)
+              if match:
+                  return match.group(1).strip('. -_')
+              return name_no_ext
+
+          def get_related_subs(video_paths):
+              media = []
+              for v in video_paths:
+                  media.append(v)
+                  base = os.path.splitext(v)[0]
+                  for ext in subtitle_extensions:
+                      sub_path = base + ext
+                      if os.path.exists(sub_path):
+                          media.append(sub_path)
+              return list(set(media))
+
+          def zip_files(zip_name, files_list):
+              list_file = os.path.join(root_dir, "vid_list.txt")
+              with open(list_file, "w") as f:
+                  for m in files_list:
+                      f.write(f"{os.path.basename(m)}\n")
+              
+              total_size = sum(os.path.getsize(m) for m in files_list)
+              os.chdir(root_dir)
+              
+              if total_size > MAX_SIZE_BYTES:
+                  print(f"📦 Group exceeds 7GB. Creating NATIVE split archive: {zip_name}...")
+                  subprocess.run(["7z", "a", "-v7000m", "-mx0", zip_name, "@vid_list.txt"], check=True)
+              else:
+                  print(f"🗜️ Zipping (Store Mode): {zip_name}...")
+                  subprocess.run(["7z", "a", "-mx0", zip_name, "@vid_list.txt"], check=True)
+              
+              os.remove("vid_list.txt")
+              os.chdir(original_cwd)
+              
+              for m in files_list:
+                  os.remove(m)
+
+          items = os.listdir(root_dir)
+          original_cwd = os.getcwd()
+
+          # 1. Handle Subdirectories / Folders
+          for item in items:
+              item_path = os.path.join(root_dir, item)
+              if os.path.isdir(item_path):
+                  videos = get_video_files(item_path)
+                  count = len(videos)
+                  
+                  if count > 5:
+                      zip_name = f"{item}.zip"
+                      folder_size = get_dir_size(item_path)
+                      
+                      os.chdir(root_dir)
+                      if folder_size > MAX_SIZE_BYTES:
+                          print(f"📦 Subdirectory '{item}' exceeds 7GB. Creating NATIVE split archive...")
+                          subprocess.run(["7z", "a", "-v7000m", "-mx0", zip_name, item], check=True)
+                      else:
+                          print(f"🗜️ Subdirectory '{item}' has {count} videos. Zipping (Store Mode)...")
+                          subprocess.run(["7z", "a", "-mx0", zip_name, item], check=True)
+                      
+                      os.chdir(original_cwd)
+                      shutil.rmtree(item_path)
+                  else:
+                      print(f"📁 Subdirectory '{item}' has {count} videos (≤5). Unpacking videos & subtitles to root.")
+                      media_files = get_media_files(item_path)
+                      for m in media_files:
+                          dst = os.path.join(root_dir, os.path.basename(m))
+                          if not os.path.exists(dst):
+                              shutil.move(m, dst)
+                      shutil.rmtree(item_path, ignore_errors=True)
+
+          # 2. Collect remaining loose video files at root level
+          root_videos = sorted([os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.lower().endswith(video_extensions)])
+          
+          series_groups = defaultdict(list)
+          for v in root_videos:
+              s_name = get_series_name(os.path.basename(v))
+              series_groups[s_name].append(v)
+
+          remaining_loose = []
+
+          for s_name, vids in series_groups.items():
+              if len(vids) > 3:
+                  first_ep_name = os.path.splitext(os.path.basename(vids[0]))[0]
+                  zip_name = f"{first_ep_name}.zip"
+                  print(f"📂 Found series '{s_name}' with {len(vids)} episodes (>3). Grouping into {zip_name}...")
+                  media_to_zip = get_related_subs(vids)
+                  zip_files(zip_name, media_to_zip)
+              else:
+                  remaining_loose.extend(vids)
+
+          if len(remaining_loose) > 5:
+              first_file_name = os.path.splitext(os.path.basename(remaining_loose[0]))[0]
+              zip_name = f"{first_file_name}.zip"
+              print(f"📂 Found {len(remaining_loose)} mixed loose episodes (>5). Packing into {zip_name}...")
+              media_to_zip = get_related_subs(remaining_loose)
+              zip_files(zip_name, media_to_zip)
+          else:
+              print(f"📂 Found {len(remaining_loose)} remaining loose files (≤5). Skipping grouping (treating movies/singles as non-series).")
+
+          print("✅ Smart native zipping and splitting sequence completed successfully.")
+          EOF
+
+      - name: Upload files to Filemirage
+        run: |
+          #!/usr/bin/env bash
+          SERVER=$(curl -s https://filemirage.com/api/servers | jq -r '.data.server')
+          UPLOAD_ID=$(curl -s https://filemirage.com/api/servers | jq -r '.data.upload_id')
+          
+          echo "Using server: $SERVER"
+          echo "Upload ID: $UPLOAD_ID"
+          
+          find "$FOLDER_PATH" -type f | sort | while read -r FILE; do
+              if [[ "$FILE" == *".!qB"* || "$FILE" == *".part"* ]]; then
+                  continue
+              fi
+
+              FILENAME=$(basename "$FILE")
+              FILE_SIZE_MB=$(awk "BEGIN {printf \"%.2f\", $(stat -c%s "$FILE")/1024/1024}")
+              echo "Uploading: $FILE ($FILE_SIZE_MB MB)"
+              
+              RESPONSE=$(curl -s -H "Authorization: Bearer $FILEMIRAGE_API_TOKEN" \
+                -F "file=@$FILE;filename=$FILENAME" \
+                "$SERVER/upload.php")
+              
+              if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+                  success=$(echo "$RESPONSE" | jq -r '.success')
+                  if [ "$success" != "true" ]; then
+                      echo "❌ Failed to upload $FILENAME: $(echo "$RESPONSE" | jq -r '.message')"
+                  else
+                      echo "✅ Successfully uploaded: $FILENAME"
+                  fi
+              else
+                  echo "❌ Server returned an invalid response (not JSON)."
+                  echo "Raw Server Response:"
+                  echo "$RESPONSE"
+              fi
+          done
