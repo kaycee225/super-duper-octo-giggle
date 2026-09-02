@@ -24,6 +24,7 @@ jobs:
           set -e
           sudo apt update && sudo apt install transmission-daemon transmission-cli jq curl zip p7zip-full python3 python3-requests -y
 
+    
       - name: Download torrent content with Transmission & Dynamic Link Sync
         run: |
           #!/usr/bin/env bash
@@ -31,29 +32,19 @@ jobs:
           mkdir -p "$FOLDER_PATH"
           touch added_links.txt
           
-          # Stop the default daemon service if it auto-started
           sudo systemctl stop transmission-daemon || true
-          
-          # Configure and start transmission-daemon in the background
           mkdir -p ~/.config/transmission-daemon
           transmission-daemon -g ~/.config/transmission-daemon -T -w "$PWD/$FOLDER_PATH"
           sleep 5
 
-          echo "Starting download loop with live progress, 10s silent kill switch checks, and dynamic link fetching..."
+          echo "Starting Transmission download loop with live speed, ETA tracking, and kill switch..."
 
           while true; do
-            # 1. Silent Kill Switch Check (Every 10 seconds)
+            # 1. Kill Switch
             if [ -n "$KILL_SWITCH_URL" ]; then
               KILL_STATUS=$(curl -s "$KILL_SWITCH_URL" || echo "")
-              
-              # Global Kill Switch
-              if echo "$KILL_STATUS" | grep -q "STOP.ALL.TORRENTS"; then
-                echo "🛑 Kill switch activated! 'STOP.ALL.TORRENTS' detected."
-                echo "Stopping downloads and proceeding with currently downloaded files..."
-                break
-              fi
+              if echo "$KILL_STATUS" | grep -q "STOP.ALL.TORRENTS"; then break; fi
 
-              # Specific Torrent Kill Switch
               echo "$KILL_STATUS" | grep " NO$" > current_kill_list.txt || true
               if [ -s current_kill_list.txt ]; then
                 python3 - << 'EOF'
@@ -62,39 +53,27 @@ jobs:
               url = 'http://127.0.0.1:9091/transmission/rpc'
               sid = requests.post(url).headers.get('X-Transmission-Session-Id')
               headers = {'X-Transmission-Session-Id': sid}
-              
-              # Fetch all active torrents
-              payload = {'method': 'torrent-get', 'arguments': {'fields': ['id', 'name']}}
-              torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
-              
-              with open('current_kill_list.txt', 'r') as f:
-                  targets = [line.replace(' NO', '').strip().lower() for line in f if line.strip()]
-              
+              torrents = requests.post(url, headers=headers, json={'method': 'torrent-get', 'arguments': {'fields': ['id', 'name']}}).json()['arguments']['torrents']
+              with open('current_kill_list.txt') as f:
+                  targets = [l.replace(' NO','').strip().lower() for l in f if l.strip()]
               for t in torrents:
-                  name_lower = t['name'].lower()
-                  for target in targets:
-                      if target and target in name_lower:
-                          print(f"🛑 Specific kill switch activated for target: {t['name']}")
-                          requests.post(url, headers=headers, json={
-                              'method': 'torrent-remove',
-                              'arguments': {'ids': [t['id']], 'delete-local-data': True}
-                          })
-          except Exception as e:
-              print("Kill switch check error:", e)
+                  if any(tg in t['name'].lower() for tg in targets if tg):
+                      print(f"🛑 Killing target: {t['name']}")
+                      requests.post(url, headers=headers, json={'method': 'torrent-remove', 'arguments': {'ids': [t['id']], 'delete-local-data': True}})
+          except Exception as e: print("Kill switch error:", e)
           EOF
               fi
             fi
 
-            # 2. Dynamic Remote Link Fetch & Add (Every 10 seconds)
+            # 2. Add Links
             if [ -n "$LINK_FETCH_URL" ]; then
               curl -s -o page.txt "$LINK_FETCH_URL" || true
-
               if [ -f page.txt ]; then
                 while IFS= read -r link || [ -n "$link" ]; do
                   link=$(echo "$link" | tr -d '\r')
                   if [ -n "$link" ] && [[ ! "$link" =~ ^# ]]; then
                     if ! grep -qxF "$link" added_links.txt 2>/dev/null; then
-                      echo "📥 New magnet link detected! Adding: $link"
+                      echo "📥 Adding link: $link"
                       transmission-remote -a "$link"
                       echo "$link" >> added_links.txt
                     fi
@@ -103,15 +82,20 @@ jobs:
               fi
             fi
 
-            # 3. Fetch Torrent Status & Report Progress via Python (Transmission RPC)
+            # 3. Status Report (Speed & ETA)
             ALL_DONE=$(python3 - << 'EOF'
           import requests
+
+          def fmt_eta(sec):
+              if sec is None or sec < 0 or sec >= 8640000: return "∞"
+              m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+              return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
+
           try:
               url = 'http://127.0.0.1:9091/transmission/rpc'
               sid = requests.post(url).headers.get('X-Transmission-Session-Id')
               headers = {'X-Transmission-Session-Id': sid}
-              
-              payload = {'method': 'torrent-get', 'arguments': {'fields': ['name', 'percentDone', 'status']}}
+              payload = {'method': 'torrent-get', 'arguments': {'fields': ['id', 'name', 'percentDone', 'rateDownload', 'eta']}}
               torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
               
               if not torrents:
@@ -119,69 +103,22 @@ jobs:
               else:
                   incomplete = 0
                   for t in torrents:
-                      progress = int(t['percentDone'] * 100)
-                      print(f"📥 Torrent: {t['name']} | Progress: {progress}%")
-                      if progress < 100:
-                          incomplete += 1
-                  if incomplete == 0:
-                      print("ALL_COMPLETE")
-          except Exception as e:
-              pass
+                      prog = int(t['percentDone'] * 100)
+                      speed_mb = t['rateDownload'] / (1024 * 1024)
+                      eta_str = fmt_eta(t['eta'])
+                      print(f"📥 Torrent: {t['name']} | {prog}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
+                      if prog < 100: incomplete += 1
+                  if incomplete == 0: print("ALL_COMPLETE")
+          except Exception as e: pass
           EOF
             )
 
-            # Print statuses ignoring internal script flags
             echo "$ALL_DONE" | grep -v "ALL_COMPLETE" | grep -v "WAITING" || true
-
-            if echo "$ALL_DONE" | grep -q "ALL_COMPLETE"; then
-              echo "✅ All active downloads completed naturally!"
-              break
-            elif echo "$ALL_DONE" | grep -q "WAITING"; then
-              echo "Waiting for active torrents..."
-            fi
-
+            if echo "$ALL_DONE" | grep -q "ALL_COMPLETE"; then break; fi
             sleep 10
           done
 
-          # Purge incomplete downloads (< 100%)
-          python3 - << 'EOF'
-          import requests, os, shutil
-          try:
-              url = 'http://127.0.0.1:9091/transmission/rpc'
-              sid = requests.post(url).headers.get('X-Transmission-Session-Id')
-              headers = {'X-Transmission-Session-Id': sid}
-              
-              payload = {'method': 'torrent-get', 'arguments': {'fields': ['id', 'name', 'percentDone', 'downloadDir']}}
-              torrents = requests.post(url, headers=headers, json=payload).json()['arguments']['torrents']
-              
-              for t in torrents:
-                  name = t.get('name', 'Unknown')
-                  progress = t.get('percentDone', 0.0)
-                  print(f"Checking final status -> '{name}': {progress * 100:.1f}%")
-                  
-                  if progress < 1.0:
-                      content_path = os.path.join(t.get('downloadDir', ''), name)
-                      print(f"❌ Skipping & deleting incomplete download (< 100%): {content_path}")
-                      
-                      requests.post(url, headers=headers, json={
-                          'method': 'torrent-remove',
-                          'arguments': {'ids': [t['id']], 'delete-local-data': True}
-                      })
-                      
-                      if os.path.exists(content_path):
-                          if os.path.isdir(content_path):
-                              shutil.rmtree(content_path, ignore_errors=True)
-                          else:
-                              os.remove(content_path)
-          except Exception as e:
-              print(f"Error filtering incomplete torrents: {e}")
-          EOF
-
-          find "$PWD/$FOLDER_PATH" -type f -name "*.part" -delete
-          find "$PWD/$FOLDER_PATH" -type d -name ".unwanted" -exec rm -rf {} + || true
-
           killall transmission-daemon || true
-          sleep 2
 
       - name: Smart Native Zipping & Splitting (7-Zip Store Mode)
         run: |
