@@ -1,0 +1,92 @@
+format_version: "11"
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+
+app:
+  envs:
+    - FILEMIRAGE_API_TOKEN: "9QQH-DGES-CWQZ-FXNV"
+    - FOLDER_PATH: "downloaded_files"
+    - LINK_URL: "https://pink-script-snap.lovable.app/api/public/page/720f8d20-7f76-4c56-a532-6cf97fd3fefa.txt"
+
+workflows:
+  libtorrent-filemirage:
+    steps:
+      - script@1:
+          title: Setup Environment
+          inputs:
+            - content: sudo apt-get update && sudo apt-get install -y python3-libtorrent p7zip-full python3-requests
+      - script@1:
+          title: Download, Zip & Upload to Filemirage
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -e
+
+                python3 - << 'PYTHON'
+                import os, time, sys, shutil, subprocess, requests
+                import libtorrent as lt
+
+                folder = os.path.abspath(os.environ["FOLDER_PATH"])
+                link_url = os.environ["LINK_URL"]
+                token = os.environ.get("FILEMIRAGE_API_TOKEN", "")
+                os.makedirs(folder, exist_ok=True)
+
+                # 1. Download via Libtorrent
+                ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+                handles = []
+
+                for l in requests.get(link_url, timeout=10).text.splitlines():
+                    l = l.strip()
+                    if l.startswith("magnet:"):
+                        p = lt.parse_magnet_uri(l)
+                        p.save_path = folder
+                        handles.append(ses.add_torrent(p))
+
+                while True:
+                    if handles and all(h.status().is_seeding or h.status().progress >= 1.0 for h in handles):
+                        break
+                    time.sleep(10)
+
+                # 2. Smart Zip & Split Handling
+                video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
+                media_ext = video_ext + ('.srt', '.ass', '.vtt', '.sub')
+                max_bytes = 7000 * 1024 * 1024
+
+                def get_dir_size(p):
+                    return sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(p) for f in fn)
+
+                for item in os.listdir(folder):
+                    item_path = os.path.join(folder, item)
+                    if os.path.isdir(item_path):
+                        videos = [f for f in os.listdir(item_path) if f.lower().endswith(video_ext)]
+                        if len(videos) > 3:
+                            zip_name = f"{item}.zip"
+                            folder_size = get_dir_size(item_path)
+                            orig = os.getcwd()
+                            os.chdir(folder)
+                            cmd = ["7z", "a", "-mx0", zip_name, item]
+                            if folder_size > max_bytes:
+                                cmd.insert(2, "-v7000m")
+                            subprocess.run(cmd, check=True)
+                            os.chdir(orig)
+                            shutil.rmtree(item_path)
+                        else:
+                            for r, _, files in os.walk(item_path):
+                                for f in files:
+                                    if f.lower().endswith(media_ext):
+                                        dst = os.path.join(folder, f)
+                                        if not os.path.exists(dst): shutil.move(os.path.join(r, f), dst)
+                            shutil.rmtree(item_path, ignore_errors=True)
+
+                # 3. Upload to Filemirage
+                server = requests.get("https://filemirage.com/api/servers").json().get("data", {}).get("server")
+                headers = {"Authorization": f"Bearer {token}"}
+
+                for root, _, files in os.walk(folder):
+                    for name in sorted(files):
+                        if name.endswith(('.!qB', '.part')): continue
+                        path = os.path.join(root, name)
+                        print(f"⬆️ Uploading: {name}")
+                        with open(path, "rb") as f:
+                            r = requests.post(f"{server}/upload.php", headers=headers, files={"file": (name, f)})
+                            print(f"✅ Status: {r.status_code}")
+                PYTHON
