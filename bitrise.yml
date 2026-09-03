@@ -9,7 +9,7 @@ app:
 
 workflows:
   libtorrent-filemirage:
-        steps:
+      steps:
       - script@1:
           title: Setup Environment
           inputs:
