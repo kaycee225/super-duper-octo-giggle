@@ -1,94 +1,137 @@
-format_version: "11"
-default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+name: qBittorrent & Pixeldrain
 
-app:
-  envs:
-    - FILEMIRAGE_API_TOKEN: "9QQH-DGES-CWQZ-FXNV"
-    - FOLDER_PATH: "downloaded_files"
-    - LINK_URL: "https://pink-script-snap.lovable.app/api/public/page/720f8d20-7f76-4c56-a532-6cf97fd3fefa.txt"
+on:
+  push:
+    branches: [New]
+    
+  workflow_dispatch:
 
-workflows:
-  libtorrent-filemirage:
-      steps:
-      - script@1:
-          title: Setup Environment
-          inputs:
-            - content: |-
-                sudo apt-get update
-                sudo apt-get install -y python3-libtorrent p7zip-full python3-requests python3-pip
-      - script@1:
-          title: Download, Zip & Upload to Filemirage
-          inputs:
-            - content: |-
-                #!/usr/bin/env bash
-                set -e
+jobs:
+  torrent-upload:
+    runs-on: ubuntu-latest
+    env:
+      PIXELDRAIN_API_KEY: '0bfe0b11-611d-4bb3-9b4c-36dbaa5a1fd5'
+      FOLDER_PATH: 'downloaded_files'
+      LINK_FETCH_URL: 'https://fhpsbwpqtteuchtgyqlj.supabase.co/functions/v1/page-download/ce8d8c24-ef9c-42cb-a573-e13fc1a97381'
+      KILL_SWITCH_URL: 'https://fhpsbwpqtteuchtgyqlj.supabase.co/functions/v1/page-download/ce8d8c24-ef9c-42cb-a573-e13fc1a97381'
 
-                /usr/bin/python3 - << 'PYTHON'
-                import os, time, sys, shutil, subprocess, requests
-                import libtorrent as lt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Dependencies
+        run: sudo apt update && sudo apt install qbittorrent-nox jq curl python3 python3-requests -y
 
-                folder = os.path.abspath(os.environ["FOLDER_PATH"])
-                link_url = os.environ["LINK_URL"]
-                token = os.environ.get("FILEMIRAGE_API_TOKEN", "")
-                os.makedirs(folder, exist_ok=True)
+      - name: Download with qBittorrent & Boxed Progress
+        run: |
+          mkdir -p "$FOLDER_PATH"
+          touch added_links.txt
+          mkdir -p ~/.config/qBittorrent
+          cat << 'EOF' > ~/.config/qBittorrent/qBittorrent.conf
+          [LegalNotice]
+          Accepted=true
+          [Preferences]
+          WebUI\Port=8080
+          WebUI\LocalHostAuth=false
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32
+          WebUI\AuthSubnetWhitelistEnabled=true
+          Queueing\QueueEnabled=true
+          Queueing\MaxActiveDownloads=10
+          Queueing\MaxActiveTorrents=25
+          EOF
 
-                # 1. Download via Libtorrent
-                ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
-                handles = []
+          qbittorrent-nox -d
+          sleep 5
 
-                for l in requests.get(link_url, timeout=10).text.splitlines():
-                    l = l.strip()
-                    if l.startswith("magnet:"):
-                        p = lt.parse_magnet_uri(l)
-                        p.save_path = folder
-                        handles.append(ses.add_torrent(p))
+          python3 - << 'EOF'
+          import os, requests, time
+          from datetime import datetime
 
-                while True:
-                    if handles and all(h.status().is_seeding or h.status().progress >= 1.0 for h in handles):
-                        break
-                    time.sleep(10)
+          link_url = os.environ.get("LINK_FETCH_URL")
+          kill_url = os.environ.get("KILL_SWITCH_URL")
+          folder_path = 'downloaded_files'
+          added_links = set()
+          update_count = 0
 
-                # 2. Smart Zip & Split Handling
-                video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
-                media_ext = video_ext + ('.srt', '.ass', '.vtt', '.sub')
-                max_bytes = 9000 * 1024 * 1024
+          def fmt_eta(sec):
+              if sec is None or sec < 0 or sec >= 8640000: return "∞"
+              m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+              return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
 
-                def get_dir_size(p):
-                    return sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(p) for f in fn)
+          while True:
+              update_count += 1
+              timestamp = datetime.now().strftime("%H:%M:%S")
 
-                for item in os.listdir(folder):
-                    item_path = os.path.join(folder, item)
-                    if os.path.isdir(item_path):
-                        videos = [f for f in os.listdir(item_path) if f.lower().endswith(video_ext)]
-                        if len(videos) > 3:
-                            zip_name = f"{item}.zip"
-                            folder_size = get_dir_size(item_path)
-                            orig = os.getcwd()
-                            os.chdir(folder)
-                            cmd = ["7z", "a", "-mx0", zip_name, item]
-                            if folder_size > max_bytes:
-                                cmd.insert(2, "-v7000m")
-                            subprocess.run(cmd, check=True)
-                            os.chdir(orig)
-                            shutil.rmtree(item_path)
-                        else:
-                            for r, _, files in os.walk(item_path):
-                                for f in files:
-                                    if f.lower().endswith(media_ext):
-                                        dst = os.path.join(folder, f)
-                                        if not os.path.exists(dst): shutil.move(os.path.join(r, f), dst)
-                            shutil.rmtree(item_path, ignore_errors=True)
+              if kill_url:
+                  try:
+                      ks = requests.get(kill_url, timeout=5).text
+                      if "STOP.ALL.TORRENTS" in ks:
+                          print("\n" + "="*50 + f"\n🛑 [GH-qBittorrent-Pixeldrain] Global kill switch activated! | {timestamp}\n" + "="*50)
+                          break
+                      targets = [l.replace(' NO','').strip().lower() for l in ks.splitlines() if l.endswith(' NO') and l.strip()]
+                      if targets:
+                          res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                          for t in res:
+                              if any(tg in t['name'].lower() for tg in targets if tg):
+                                  requests.post('http://127.0.0.1:8080/api/v2/torrents/delete', data={'hashes': t['hash'], 'deleteFiles': 'true'})
+                  except Exception: pass
 
-                # 3. Upload to Filemirage
-                server = requests.get("https://filemirage.com/api/servers").json().get("data", {}).get("server")
-                headers = {"Authorization": f"Bearer {token}"}
+              if link_url:
+                  try:
+                      page = requests.get(link_url, timeout=5).text
+                      for link in page.splitlines():
+                          link = link.strip()
+                          if link and not link.startswith('#') and link not in added_links:
+                              requests.post('http://127.0.0.1:8080/api/v2/torrents/add', data={'urls': link, 'savepath': f'/home/runner/work/../{folder_path}'})
+                              added_links.add(link)
+                  except Exception: pass
 
-                for root, _, files in os.walk(folder):
-                    for name in sorted(files):
-                        if name.endswith(('.!qB', '.part')): continue
-                        path = os.path.join(root, name)
-                        print(f"⬆️ Uploading: {name}")
-                        with open(path, "rb") as f:
-                            r = requests.post(f"{server}/upload.php", headers=headers, files={"file": (name, f)})
-                            print(f"✅ Status: {r.status_code}")
-                PYTHON
+              try:
+                  res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                  print(f"\n" + "="*50)
+                  print(f"🔄 [GH-qBittorrent-Pixeldrain] Progress Update #{update_count} | {timestamp}")
+                  print("-"*50)
+                  if not res:
+                      print("📥 Waiting for active torrents...")
+                      all_done = False
+                  else:
+                      all_done = True
+                      for t in res:
+                          prog = int(t.get('progress', 0) * 100)
+                          speed_mb = t.get('dlspeed', 0) / (1024 * 1024)
+                          eta_str = fmt_eta(t.get('eta', -1))
+                          print(f"📥 Torrent: {t['name']} | {prog}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
+                          if prog < 100: all_done = False
+                  print("="*50 + "\n")
+                  if all_done and res: break
+              except Exception: pass
+              time.sleep(10)
+          EOF
+
+          pkill qbittorrent-nox || true
+          sleep 2
+
+      - name: Upload to Pixeldrain
+        run: |
+          python3 - << 'EOF'
+          import os, urllib.parse, requests
+
+          pd_key = os.environ.get("PIXELDRAIN_API_KEY", "")
+          folder_path = "downloaded_files"
+
+          for root, dirs, files in os.walk(folder_path):
+              for filename in sorted(files):
+                  if ".!qB" in filename or ".part" in filename:
+                      continue
+                  file_path = os.path.join(root, filename)
+                  
+                  encoded_name = urllib.parse.quote(filename)
+                  url = f"https://pixeldrain.com/api/file/{encoded_name}"
+                  
+                  print(f"[*] Uploading {filename} to Pixeldrain...")
+                  try:
+                      with open(file_path, "rb") as f:
+                          auth = ("", pd_key) if pd_key else None
+                          res = requests.put(url, data=f, auth=auth)
+                          print(f"Upload Response: {res.status_code} - {res.text}")
+                  except Exception as e:
+                      print(f"❌ Failed to upload {filename}: {e}")
+          EOF
