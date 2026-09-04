@@ -51,7 +51,7 @@ workflows:
                 # 2. Smart Zip & Split Handling
                 video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
                 media_ext = video_ext + ('.srt', '.ass', '.vtt', '.sub')
-                max_bytes = 7000 * 1024 * 1024
+                max_bytes = 9000 * 1024 * 1024
 
                 def get_dir_size(p):
                     return sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(p) for f in fn)
