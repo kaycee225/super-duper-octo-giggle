@@ -2,7 +2,7 @@ name: qBittorrent & Pixeldrain
 
 on:
   push:
-    branches: [New]
+    branches: Pixelupqbit
     
   workflow_dispatch:
 
