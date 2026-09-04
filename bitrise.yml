@@ -36,6 +36,7 @@ workflows:
                 ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
                 handles = []
 
+                print("Fetching magnet links...", flush=True)
                 for l in requests.get(link_url, timeout=10).text.splitlines():
                     l = l.strip()
                     if l.startswith("magnet:"):
@@ -43,12 +44,32 @@ workflows:
                         p.save_path = folder
                         handles.append(ses.add_torrent(p))
 
+                # ⏳ Real-time Progress Loop
                 while True:
-                    if handles and all(h.status().is_seeding or h.status().progress >= 1.0 for h in handles):
+                    if not handles:
+                        print("No magnets found.", flush=True)
                         break
+
+                    all_done = True
+                    for h in handles:
+                        s = h.status()
+                        name = h.name() if h.has_metadata() else "Downloading metadata..."
+                        
+                        # Print progress and force flush for Bitrise logs
+                        print(f"⬇️ [{name}] Progress: {s.progress * 100:.2f}% | Rate: {s.download_rate / 1024:.1f} kB/s", flush=True)
+                        
+                        if not (s.is_seeding or s.progress >= 1.0):
+                            all_done = False
+                    
+                    if all_done:
+                        print("✅ All downloads finished!", flush=True)
+                        break
+                    
+                    print("-" * 40, flush=True)
                     time.sleep(10)
 
                 # 2. Smart Zip & Split Handling
+                print("Starting ZIP & Split handling...", flush=True)
                 video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
                 media_ext = video_ext + ('.srt', '.ass', '.vtt', '.sub')
                 max_bytes = 9000 * 1024 * 1024
@@ -87,8 +108,8 @@ workflows:
                     for name in sorted(files):
                         if name.endswith(('.!qB', '.part')): continue
                         path = os.path.join(root, name)
-                        print(f"⬆️ Uploading: {name}")
+                        print(f"⬆️ Uploading: {name}", flush=True)
                         with open(path, "rb") as f:
                             r = requests.post(f"{server}/upload.php", headers=headers, files={"file": (name, f)})
-                            print(f"✅ Status: {r.status_code}")
+                            print(f"✅ Status: {r.status_code}", flush=True)
                 PYTHON
