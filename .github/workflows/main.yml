@@ -1,0 +1,158 @@
+name: qBittorrent & Pixeldrain
+
+on:
+  push:
+    branches: yy
+    
+  workflow_dispatch:
+
+jobs:
+  torrent-upload:
+    runs-on: ubuntu-latest
+    env:
+      PIXELDRAIN_API_KEY: '0bfe0b11-611d-4bb3-9b4c-36dbaa5a1fd5'
+      FOLDER_PATH: 'downloaded_files'
+      LINK_FETCH_URL: ''
+      KILL_SWITCH_URL: 'https://fhpsbwpqtteuchtgyqlj.supabase.co/functions/v1/page-download/ce8d8c24-ef9c-42cb-a573-e13fc1a97381'
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Dependencies
+        run: sudo apt update && sudo apt install qbittorrent-nox jq curl python3 python3-requests -y
+
+      - name: Download with qBittorrent & Boxed Progress
+        run: |
+          mkdir -p "$FOLDER_PATH"
+          mkdir -p torrents
+          touch added_links.txt
+          mkdir -p ~/.config/qBittorrent
+          cat << 'EOF' > ~/.config/qBittorrent/qBittorrent.conf
+          [LegalNotice]
+          Accepted=true
+          [Preferences]
+          WebUI\Port=8080
+          WebUI\LocalHostAuth=false
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32
+          WebUI\AuthSubnetWhitelistEnabled=true
+          Queueing\QueueEnabled=true
+          Queueing\MaxActiveDownloads=10
+          Queueing\MaxActiveTorrents=25
+          EOF
+
+          qbittorrent-nox -d
+          sleep 5
+
+          python3 - << 'EOF'
+          import os, requests, time, glob
+          from datetime import datetime
+
+          link_url = os.environ.get("LINK_FETCH_URL")
+          kill_url = os.environ.get("KILL_SWITCH_URL")
+          folder_path = os.environ.get("FOLDER_PATH", "downloaded_files")
+          absolute_save_path = os.path.abspath(folder_path)
+          added_links = set()
+          update_count = 0
+
+          def fmt_eta(sec):
+              if sec is None or sec < 0 or sec >= 8640000: return "∞"
+              m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+              return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+          while True:
+              update_count += 1
+              timestamp = datetime.now().strftime("%H:%M:%S")
+
+              # 1. Handle Kill Switch
+              if kill_url:
+                  try:
+                      ks = requests.get(kill_url, timeout=5).text
+                      if "STOP.ALL.TORRENTS" in ks:
+                          print("\n" + "="*50 + f"\n🛑 [GH-qBittorrent-Pixeldrain] Global kill switch activated! | {timestamp}\n" + "="*50)
+                          break
+                      targets = [l.replace(' NO','').strip().lower() for l in ks.splitlines() if l.endswith(' NO') and l.strip()]
+                      if targets:
+                          res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                          for t in res:
+                              if any(tg in t['name'].lower() for tg in targets if tg):
+                                  requests.post('http://127.0.0.1:8080/api/v2/torrents/delete', data={'hashes': t['hash'], 'deleteFiles': 'true'})
+                  except Exception: pass
+
+              # 2. Add Local .torrent Files from repository (torrents/ folder)
+              for torrent_file in glob.glob("torrents/*.torrent"):
+                  if torrent_file not in added_links:
+                      try:
+                          with open(torrent_file, 'rb') as f:
+                              requests.post(
+                                  'http://127.0.0.1:8080/api/v2/torrents/add',
+                                  files={'torrents': f},
+                                  data={'savepath': absolute_save_path}
+                              )
+                          added_links.add(torrent_file)
+                          print(f"📥 Added local torrent file: {torrent_file}")
+                      except Exception as e:
+                          print(f"⚠️ Failed to add local torrent {torrent_file}: {e}")
+
+              # 3. Add Remote Links/Magnets/Torrent URLs
+              if link_url:
+                  try:
+                      page = requests.get(link_url, timeout=5).text
+                      for link in page.splitlines():
+                          link = link.strip()
+                          if link and not link.startswith('#') and link not in added_links:
+                              requests.post('http://127.0.0.1:8080/api/v2/torrents/add', data={'urls': link, 'savepath': absolute_save_path})
+                              added_links.add(link)
+                  except Exception: pass
+
+              # 4. Monitor Progress
+              try:
+                  res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                  print(f"\n" + "="*50)
+                  print(f"🔄 [GH-qBittorrent-Pixeldrain] Progress Update #{update_count} | {timestamp}")
+                  print("-"*50)
+                  if not res:
+                      print("📥 Waiting for active torrents...")
+                      all_done = False
+                  else:
+                      all_done = True
+                      for t in res:
+                          prog = int(t.get('progress', 0) * 100)
+                          speed_mb = t.get('dlspeed', 0) / (1024 * 1024)
+                          eta_str = fmt_eta(t.get('eta', -1))
+                          print(f"📥 Torrent: {t['name']} | {prog}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
+                          if prog < 100: all_done = False
+                  print("="*50 + "\n")
+                  if all_done and res: break
+              except Exception: pass
+              time.sleep(10)
+          EOF
+
+          pkill qbittorrent-nox || true
+          sleep 2
+
+      - name: Upload to Pixeldrain
+        run: |
+          python3 - << 'EOF'
+          import os, urllib.parse, requests
+
+          pd_key = os.environ.get("PIXELDRAIN_API_KEY", "")
+          folder_path = "downloaded_files"
+
+          for root, dirs, files in os.walk(folder_path):
+              for filename in sorted(files):
+                  if ".!qB" in filename or ".part" in filename:
+                      continue
+                  file_path = os.path.join(root, filename)
+                  
+                  encoded_name = urllib.parse.quote(filename)
+                  url = f"https://pixeldrain.com/api/file/{encoded_name}"
+                  
+                  print(f"[*] Uploading {filename} to Pixeldrain...")
+                  try:
+                      with open(file_path, "rb") as f:
+                          auth = ("", pd_key) if pd_key else None
+                          res = requests.put(url, data=f, auth=auth)
+                          print(f"Upload Response: {res.status_code} - {res.text}")
+                  except Exception as e:
+                      print(f"❌ Failed to upload {filename}: {e}")
+          EOF
