@@ -1,23 +1,32 @@
-name: qBittorrent -> Pixeldrain (No ZIP)
+name: qBittorrent & Pixeldrain
 
 on:
   push:
     branches: Pixupnozip
+    
   workflow_dispatch:
 
 jobs:
-  run:
+  torrent-upload:
     runs-on: ubuntu-latest
     env:
-      PIXELDRAIN_API_KEY: '0bfe0b11-611d-4bb3-9b4c-36dbaa5a1fd5'
+      # Replace this with your actual Pixeldrain API key if different
+      PIXELDRAIN_API_KEY: '0bfe0b11-611d-4bb3-9b4c-36dbaa5a1fd5' 
       FOLDER_PATH: 'downloaded_files'
       LINK_FETCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/a64771c8-4919-4f15-8574-1bfb22908f40.txt'
+      KILL_SWITCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/a64771c8-4919-4f15-8574-1bfb22908f40.txt'
+
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt update && sudo apt install -y qbittorrent-nox python3-requests curl
-      - run: |
-          mkdir -p "$FOLDER_PATH" ~/.config/qBittorrent
-          cat << 'CONF' > ~/.config/qBittorrent/qBittorrent.conf
+      - name: Install Dependencies
+        run: sudo apt update && sudo apt install qbittorrent-nox jq curl zip p7zip-full python3 python3-requests -y
+
+      - name: Download with qBittorrent & Boxed Progress
+        run: |
+          mkdir -p "$FOLDER_PATH"
+          touch added_links.txt
+          mkdir -p ~/.config/qBittorrent
+          cat << 'EOF' > ~/.config/qBittorrent/qBittorrent.conf
           [LegalNotice]
           Accepted=true
           [Preferences]
@@ -25,32 +34,116 @@ jobs:
           WebUI\LocalHostAuth=false
           WebUI\AuthSubnetWhitelist=127.0.0.1/32
           WebUI\AuthSubnetWhitelistEnabled=true
-          CONF
-          qbittorrent-nox -d && sleep 5
+          Queueing\QueueEnabled=true
+          Queueing\MaxActiveDownloads=10
+          Queueing\MaxActiveTorrents=25
+          EOF
+
+          qbittorrent-nox -d
+          sleep 5
+
           python3 - << 'EOF'
-          import os, requests, time, glob, urllib.parse
-          save_path = os.path.abspath(os.environ.get("FOLDER_PATH", "downloaded_files"))
-          link_url, pd_key = os.environ.get("LINK_FETCH_URL"), os.environ.get("PIXELDRAIN_API_KEY", "")
-          added = set()
+          import requests, time, os
+          from datetime import datetime
+
+          link_url = 'https://pink-script-snap.lovable.app/api/public/page/a64771c8-4919-4f15-8574-1bfb22908f40.txt'
+          kill_url = 'https://pink-script-snap.lovable.app/api/public/page/a64771c8-4919-4f15-8574-1bfb22908f40.txt'
+          folder_path = 'downloaded_files'
+          absolute_save_path = os.path.abspath(folder_path)
+          added_links = set()
+          update_count = 0
+
+          def fmt_eta(sec):
+              if sec is None or sec < 0 or sec >= 8640000: return "∞"
+              m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+              return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
 
           while True:
-              for tf in glob.glob("**/*.torrent", recursive=True):
-                  p = os.path.abspath(tf)
-                  if p not in added:
-                      with open(p, 'rb') as f: requests.post('http://127.0.0.1:8080/api/v2/torrents/add', files={'torrents': f}, data={'savepath': save_path})
-                      added.add(p)
-              if link_url:
-                  for l in requests.get(link_url, timeout=5).text.splitlines():
-                      l = l.strip()
-                      if l and l not in added: requests.post('http://127.0.0.1:8080/api/v2/torrents/add', data={'urls': l, 'savepath': save_path}); added.add(l)
-              res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
-              if res and all(t.get('progress', 0) >= 1.0 for t in res): break
-              time.sleep(10)
-          os.system("pkill qbittorrent-nox || true")
+              update_count += 1
+              timestamp = datetime.now().strftime("%H:%M:%S")
 
-          for root, _, files in os.walk(FOLDER_PATH):
-              for f in sorted(files):
-                  if not f.endswith(('.part', '.!qB')):
-                      with open(os.path.join(root, f), "rb") as fp:
-                          requests.put(f"https://pixeldrain.com/api/file/{urllib.parse.quote(f)}", data=fp, auth=("", pd_key) if pd_key else None)
+              if kill_url:
+                  try:
+                      ks = requests.get(kill_url, timeout=5).text
+                      if "STOP.ALL.TORRENTS" in ks:
+                          print("\n" + "="*50 + f"\n🛑 [GH-qBittorrent-Pixeldrain] Global kill switch activated! | {timestamp}\n" + "="*50)
+                          break
+                      targets = [l.replace(' NO','').strip().lower() for l in ks.splitlines() if l.endswith(' NO') and l.strip()]
+                      if targets:
+                          res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                          for t in res:
+                              if any(tg in t['name'].lower() for tg in targets if tg):
+                                  requests.post('http://127.0.0.1:8080/api/v2/torrents/delete', data={'hashes': t['hash'], 'deleteFiles': 'true'})
+                  except Exception: pass
+
+              if link_url:
+                  try:
+                      page = requests.get(link_url, timeout=5).text
+                      for link in page.splitlines():
+                          link = link.strip()
+                          if link and not link.startswith('#') and link not in added_links:
+                              requests.post('http://127.0.0.1:8080/api/v2/torrents/add', data={'urls': link, 'savepath': absolute_save_path})
+                              added_links.add(link)
+                  except Exception: pass
+
+              try:
+                  res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+                  print(f"\n" + "="*50)
+                  print(f"🔄 [GH-qBittorrent-Pixeldrain] Progress Update #{update_count} | {timestamp}")
+                  print("-"*50)
+                  if not res:
+                      print("📥 Waiting for active torrents...")
+                      all_done = False
+                  else:
+                      all_done = True
+                      for t in res:
+                          prog = int(t.get('progress', 0) * 100)
+                          speed_mb = t.get('dlspeed', 0) / (1024 * 1024)
+                          eta_str = fmt_eta(t.get('eta', -1))
+                          print(f"📥 Torrent: {t['name']} | {prog}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
+                          if prog < 100: all_done = False
+                  print("="*50 + "\n")
+                  if all_done and res: break
+              except Exception: pass
+              time.sleep(10)
           EOF
+
+          pkill qbittorrent-nox || true
+          sleep 2
+
+      - name: Upload to Pixeldrain
+        run: |
+          if [ ! -d "$FOLDER_PATH" ]; then
+              echo "❌ Error: Folder $FOLDER_PATH does not exist."
+              exit 1
+          fi
+
+          # Using -print0 and read -d '' ensures spaces and special characters are perfectly preserved
+          find "$FOLDER_PATH" -type f -print0 | sort -z | while IFS= read -r -d '' FILE; do
+              # Skip qBittorrent temp files
+              if [[ "$FILE" == *".!qB"* || "$FILE" == *".part"* ]]; then continue; fi
+              
+              FILENAME=$(basename "$FILE")
+              
+              # URL-encode the filename using jq (handles spaces, &, #, +, etc.)
+              ENCODED_FILENAME=$(jq -rn --arg x "$FILENAME" '$x|@uri')
+              
+              echo "📤 Uploading: $FILENAME to Pixeldrain..."
+              
+              # Upload via Pixeldrain PUT API with API Key Auth
+              RESPONSE=$(curl -s -u ":${{ env.PIXELDRAIN_API_KEY }}" -T "$FILE" "https://pixeldrain.com/api/file/$ENCODED_FILENAME")
+              
+              # Parse JSON response
+              SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+              FILE_ID=$(echo "$RESPONSE" | jq -r '.id')
+              
+              if [ "$SUCCESS" == "true" ]; then
+                  echo "✅ Successfully uploaded: $FILENAME"
+                  echo "🔗 Link: https://pixeldrain.com/u/$FILE_ID"
+                  echo "---------------------------------------------------"
+              else
+                  echo "❌ Failed to upload $FILENAME"
+                  echo "API Response: $RESPONSE"
+                  exit 1
+              fi
+          done
