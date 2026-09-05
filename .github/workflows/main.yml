@@ -79,7 +79,7 @@ jobs:
                   except Exception: pass
 
               # 2. Add Local .torrent Files from repository (torrents/ folder)
-              for torrent_file in glob.glob("torrents/*.torrent"):
+              for torrent_file in glob.glob("*.torrent"):
                   if torrent_file not in added_links:
                       try:
                           with open(torrent_file, 'rb') as f:
