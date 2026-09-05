@@ -2,7 +2,7 @@ name: qBittorrent & Pixeldrain
 
 on:
   push:
-    branches: yy
+    branches: Torr
     
   workflow_dispatch:
 
