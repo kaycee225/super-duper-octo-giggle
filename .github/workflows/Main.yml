@@ -2,7 +2,7 @@ name: qBittorrent -> Pixeldrain (No ZIP)
 
 on:
   push:
-    branches: ff
+    branches: Pixupnozip
   workflow_dispatch:
 
 jobs:
