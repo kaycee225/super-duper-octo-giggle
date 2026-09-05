@@ -1,0 +1,56 @@
+name: qBittorrent -> Pixeldrain (No ZIP)
+
+on:
+  push:
+    branches: ff
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PIXELDRAIN_API_KEY: '0bfe0b11-611d-4bb3-9b4c-36dbaa5a1fd5'
+      FOLDER_PATH: 'downloaded_files'
+      LINK_FETCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/a64771c8-4919-4f15-8574-1bfb22908f40.txt'
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt update && sudo apt install -y qbittorrent-nox python3-requests curl
+      - run: |
+          mkdir -p "$FOLDER_PATH" ~/.config/qBittorrent
+          cat << 'CONF' > ~/.config/qBittorrent/qBittorrent.conf
+          [LegalNotice]
+          Accepted=true
+          [Preferences]
+          WebUI\Port=8080
+          WebUI\LocalHostAuth=false
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32
+          WebUI\AuthSubnetWhitelistEnabled=true
+          CONF
+          qbittorrent-nox -d && sleep 5
+          python3 - << 'EOF'
+          import os, requests, time, glob, urllib.parse
+          save_path = os.path.abspath(os.environ.get("FOLDER_PATH", "downloaded_files"))
+          link_url, pd_key = os.environ.get("LINK_FETCH_URL"), os.environ.get("PIXELDRAIN_API_KEY", "")
+          added = set()
+
+          while True:
+              for tf in glob.glob("**/*.torrent", recursive=True):
+                  p = os.path.abspath(tf)
+                  if p not in added:
+                      with open(p, 'rb') as f: requests.post('http://127.0.0.1:8080/api/v2/torrents/add', files={'torrents': f}, data={'savepath': save_path})
+                      added.add(p)
+              if link_url:
+                  for l in requests.get(link_url, timeout=5).text.splitlines():
+                      l = l.strip()
+                      if l and l not in added: requests.post('http://127.0.0.1:8080/api/v2/torrents/add', data={'urls': l, 'savepath': save_path}); added.add(l)
+              res = requests.get('http://127.0.0.1:8080/api/v2/torrents/info').json()
+              if res and all(t.get('progress', 0) >= 1.0 for t in res): break
+              time.sleep(10)
+          os.system("pkill qbittorrent-nox || true")
+
+          for root, _, files in os.walk(FOLDER_PATH):
+              for f in sorted(files):
+                  if not f.endswith(('.part', '.!qB')):
+                      with open(os.path.join(root, f), "rb") as fp:
+                          requests.put(f"https://pixeldrain.com/api/file/{urllib.parse.quote(f)}", data=fp, auth=("", pd_key) if pd_key else None)
+          EOF
