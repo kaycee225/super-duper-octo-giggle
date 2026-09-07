@@ -11,7 +11,6 @@ app:
 workflows:
   libtorrent-filemirage:
       steps:
-      - activate-ssh-key@4: {}
       - git-clone@6: {}
       - script@1:
           title: Setup Environment
@@ -86,7 +85,7 @@ workflows:
                             except Exception as e:
                                 print(f"⚠️ Failed to add local torrent {torrent_file}: {e}", flush=True)
 
-                    # 3. Add Remote Links/Magnets/Torrent URLs
+                    # 3. Add Remote Links/Magnets/Torrent URLs (Concurrent)
                     if link_url:
                         try:
                             page = requests.get(link_url, timeout=5).text
@@ -110,7 +109,7 @@ workflows:
                                             continue
                                     handles.append(h)
                                     added_links.add(link)
-                                    print(f"📥 Added remote link: {link[:50]}...", flush=True)
+                                    print(f"📥 Added remote link concurrently: {link[:50]}...", flush=True)
                         except Exception: pass
 
                     # 4. Monitor Progress & ETA
@@ -163,7 +162,6 @@ workflows:
                     for item in os.listdir(folder):
                         item_path = os.path.join(folder, item)
                         if os.path.isdir(item_path):
-                            # Recursively find all video files across all nested subfolders
                             videos = [
                                 f for r, _, files in os.walk(item_path)
                                 for f in files if f.lower().endswith(video_ext)
