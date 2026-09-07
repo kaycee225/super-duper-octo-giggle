@@ -1,8 +1,8 @@
 format_version: "13"
-default_workflow_id: libtorrent-filemirage
+default_workflow_id: primary
 
 workflows:
-  primary:
+  libtorrent-filemirage:
     envs:
       - FILEMIRAGE_API_TOKEN: '9QQH-DGES-CWQZ-FXNV'
       - FOLDER_PATH: 'downloaded_files'
