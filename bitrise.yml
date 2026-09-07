@@ -1,115 +1,212 @@
-format_version: "11"
-default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
-
-app:
-  envs:
-    - FILEMIRAGE_API_TOKEN: "9QQH-DGES-CWQZ-FXNV"
-    - FOLDER_PATH: "downloaded_files"
-    - LINK_URL: "https://pink-script-snap.lovable.app/api/public/page/720f8d20-7f76-4c56-a532-6cf97fd3fefa.txt"
+format_version: "13"
+default_workflow_id: primary
 
 workflows:
-  libtorrent-filemirage:
-      steps:
-      - script@1:
-          title: Setup Environment
-          inputs:
-            - content: |-
-                sudo apt-get update
-                sudo apt-get install -y python3-libtorrent p7zip-full python3-requests python3-pip
-      - script@1:
-          title: Download, Zip & Upload to Filemirage
-          inputs:
-            - content: |-
-                #!/usr/bin/env bash
-                set -e
+  primary:
+    envs:
+      - FILEMIRAGE_API_TOKEN: '9QQH-DGES-CWQZ-FXNV'
+      - FOLDER_PATH: 'downloaded_files'
+      - LINK_FETCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/720f8d20-7f76-4c56-a532-6cf97fd3fefa.txt'
+      - KILL_SWITCH_URL: 'https://pink-script-snap.lovable.app/api/public/page/720f8d20-7f76-4c56-a532-6cf97fd3fefa.txt'
 
-                /usr/bin/python3 - << 'PYTHON'
-                import os, time, sys, shutil, subprocess, requests
+    steps:
+      - activate-ssh-key@4: {}
+      - git-clone@6: {}
+
+      - script@1:
+          title: Install Dependencies
+          inputs:
+            - content: |-
+                sudo apt update && sudo apt install python3-libtorrent jq curl zip p7zip-full python3 python3-requests -y
+
+      - script@1:
+          title: Download with Libtorrent & Boxed Progress
+          inputs:
+            - content: |-
+                mkdir -p "$FOLDER_PATH"
+                python3 - << 'EOF'
                 import libtorrent as lt
+                import time, os, glob, requests
+                from datetime import datetime
 
-                folder = os.path.abspath(os.environ["FOLDER_PATH"])
-                link_url = os.environ["LINK_URL"]
-                token = os.environ.get("FILEMIRAGE_API_TOKEN", "")
-                os.makedirs(folder, exist_ok=True)
+                link_url = os.environ.get('LINK_FETCH_URL')
+                kill_url = os.environ.get('KILL_SWITCH_URL')
+                folder_path = os.environ.get('FOLDER_PATH', 'downloaded_files')
+                os.makedirs(folder_path, exist_ok=True)
 
-                # 1. Download via Libtorrent
-                ses = lt.session({'listen_interfaces': '0.0.0.0:6881'})
+                ses = lt.session()
+                ses.listen_port(6881, 6891)
+
+                added_links = set()
                 handles = []
 
-                print("Fetching magnet links...", flush=True)
-                for l in requests.get(link_url, timeout=10).text.splitlines():
-                    l = l.strip()
-                    if l.startswith("magnet:"):
-                        p = lt.parse_magnet_uri(l)
-                        p.save_path = folder
-                        handles.append(ses.add_torrent(p))
+                def fmt_eta(sec):
+                    if sec is None or sec < 0 or sec >= 8640000: return "∞"
+                    m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+                    return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
 
-                # ⏳ Real-time Progress Loop
+                update_count = 0
                 while True:
+                    update_count += 1
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+
+                    # 1. Handle Kill Switch
+                    if kill_url:
+                        try:
+                            ks = requests.get(kill_url, timeout=5).text
+                            if "STOP.ALL.TORRENTS" in ks:
+                                print(f"\n🛑 Global kill switch activated! | {timestamp}")
+                                break
+                            targets = [l.replace(' NO','').strip().lower() for l in ks.splitlines() if l.endswith(' NO') and l.strip()]
+                            if targets:
+                                for h in handles:
+                                    t_name = h.status().name.lower()
+                                    if any(tg in t_name for tg in targets if tg):
+                                        ses.remove_torrent(h)
+                                        print(f"🛑 Killed torrent: {h.status().name}")
+                        except Exception: pass
+
+                    # 2. Add Local .torrent Files from repository
+                    for torrent_file in glob.glob("*.torrent"):
+                        if torrent_file not in added_links:
+                            try:
+                                info = lt.torrent_info(torrent_file)
+                                h = ses.add_torrent({'ti': info, 'save_path': folder_path})
+                                handles.append(h)
+                                added_links.add(torrent_file)
+                                print(f"📥 Added local torrent: {torrent_file}")
+                            except Exception as e:
+                                print(f"⚠️ Failed to add local torrent {torrent_file}: {e}")
+
+                    # 3. Add Remote Links/Magnets/Torrent URLs
+                    if link_url:
+                        try:
+                            page = requests.get(link_url, timeout=5).text
+                            for link in page.splitlines():
+                                link = link.strip()
+                                if link and not link.startswith('#') and link not in added_links:
+                                    params = {'url': link, 'save_path': folder_path}
+                                    h = lt.add_magnet_uri(ses, link, params)
+                                    handles.append(h)
+                                    added_links.add(link)
+                                    print(f"📥 Added remote link/magnet")
+                        except Exception: pass
+
+                    # 4. Monitor Progress
+                    print(f"\n" + "="*50)
+                    print(f"🔄 [Bitrise-Libtorrent-Filemirage] Progress Update #{update_count} | {timestamp}")
+                    print("-"*50)
+                    
                     if not handles:
-                        print("No magnets found.", flush=True)
-                        break
+                        print("📥 Waiting for active torrents...")
+                        all_done = False
+                    else:
+                        all_done = True
+                        active_handles = []
+                        for h in handles:
+                            if not h.is_valid(): continue
+                            active_handles.append(h)
+                            st = h.status()
+                            prog = int(st.progress * 100)
+                            speed_mb = st.download_rate / (1024 * 1024)
+                            
+                            eta = -1
+                            if st.download_rate > 0:
+                                total_want = st.total_wanted - st.total_wanted_done
+                                if total_want > 0: eta = total_want / st.download_rate
+                            eta_str = fmt_eta(eta)
+                            
+                            print(f"📥 Torrent: {st.name} | {prog}% | Speed: {speed_mb:.2f} MB/s | ETA: {eta_str}")
+                            if prog < 100: all_done = False
+                        handles = active_handles
 
-                    all_done = True
-                    for h in handles:
-                        s = h.status()
-                        name = h.name() if h.has_metadata() else "Downloading metadata..."
-                        
-                        # Print progress and force flush for Bitrise logs
-                        print(f"⬇️ [{name}] Progress: {s.progress * 100:.2f}% | Rate: {s.download_rate / 1024:.1f} kB/s", flush=True)
-                        
-                        if not (s.is_seeding or s.progress >= 1.0):
-                            all_done = False
-                    
-                    if all_done:
-                        print("✅ All downloads finished!", flush=True)
-                        break
-                    
-                    print("-" * 40, flush=True)
+                    print("="*50 + "\n")
+                    if all_done and handles: break
                     time.sleep(10)
+                EOF
 
-                # 2. Smart Zip & Split Handling
-                print("Starting ZIP & Split handling...", flush=True)
+      - script@1:
+          title: Smart Zipping & Splitting
+          inputs:
+            - content: |-
+                python3 - << 'EOF'
+                import os, shutil, subprocess
+                root_dir = "downloaded_files"
                 video_ext = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v')
-                media_ext = video_ext + ('.srt', '.ass', '.vtt', '.sub')
-                max_bytes = 9000 * 1024 * 1024
+                sub_ext = ('.srt', '.ass', '.vtt', '.sub')
+                media_ext = video_ext + sub_ext
+                max_size_bytes = 7000 * 1024 * 1024
 
                 def get_dir_size(p):
                     return sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, fn in os.walk(p) for f in fn)
 
-                for item in os.listdir(folder):
-                    item_path = os.path.join(folder, item)
-                    if os.path.isdir(item_path):
-                        videos = [f for f in os.listdir(item_path) if f.lower().endswith(video_ext)]
-                        if len(videos) > 3:
-                            zip_name = f"{item}.zip"
-                            folder_size = get_dir_size(item_path)
-                            orig = os.getcwd()
-                            os.chdir(folder)
-                            cmd = ["7z", "a", "-mx0", zip_name, item]
-                            if folder_size > max_bytes:
-                                cmd.insert(2, "-v7000m")
-                            subprocess.run(cmd, check=True)
-                            os.chdir(orig)
-                            shutil.rmtree(item_path)
-                        else:
-                            for r, _, files in os.walk(item_path):
-                                for f in files:
-                                    if f.lower().endswith(media_ext):
-                                        dst = os.path.join(folder, f)
-                                        if not os.path.exists(dst): shutil.move(os.path.join(r, f), dst)
-                            shutil.rmtree(item_path, ignore_errors=True)
+                if os.path.exists(root_dir):
+                    for item in os.listdir(root_dir):
+                        item_path = os.path.join(root_dir, item)
+                        if os.path.isdir(item_path):
+                            videos = [
+                                f for r, _, files in os.walk(item_path)
+                                for f in files if f.lower().endswith(video_ext)
+                            ]
+                            
+                            if len(videos) > 3:
+                                zip_name = f"{item}.zip"
+                                folder_size = get_dir_size(item_path)
+                                orig = os.getcwd()
+                                os.chdir(root_dir)
+                                if folder_size > max_size_bytes:
+                                    subprocess.run(["7z", "a", "-v7000m", "-mx0", zip_name, item], check=True)
+                                else:
+                                    subprocess.run(["7z", "a", "-mx0", zip_name, item], check=True)
+                                os.chdir(orig)
+                                shutil.rmtree(item_path)
+                            else:
+                                for r, _, files in os.walk(item_path):
+                                    for f in files:
+                                        if f.lower().endswith(media_ext):
+                                            dst = os.path.join(root_dir, f)
+                                            if not os.path.exists(dst): shutil.move(os.path.join(r, f), dst)
+                                shutil.rmtree(item_path, ignore_errors=True)
+                EOF
 
-                # 3. Upload to Filemirage
-                server = requests.get("https://filemirage.com/api/servers").json().get("data", {}).get("server")
-                headers = {"Authorization": f"Bearer {token}"}
+      - script@1:
+          title: Upload to Filemirage
+          inputs:
+            - content: |-
+                echo "Fetching Filemirage server..."
+                SERVER=$(curl -s https://filemirage.com/api/servers | jq -r '.data.server // empty')
+                
+                if [ -z "$SERVER" ] || [ "$SERVER" == "null" ]; then
+                    echo "❌ Error: Could not fetch a valid Filemirage server URL from API."
+                    exit 1
+                fi
+                echo "🌐 Target Server: $SERVER"
 
-                for root, _, files in os.walk(folder):
-                    for name in sorted(files):
-                        if name.endswith(('.!qB', '.part')): continue
-                        path = os.path.join(root, name)
-                        print(f"⬆️ Uploading: {name}", flush=True)
-                        with open(path, "rb") as f:
-                            r = requests.post(f"{server}/upload.php", headers=headers, files={"file": (name, f)})
-                            print(f"✅ Status: {r.status_code}", flush=True)
-                PYTHON
+                if [ ! -d "$FOLDER_PATH" ]; then
+                    echo "❌ Error: Folder $FOLDER_PATH does not exist."
+                    exit 1
+                fi
+
+                find "$FOLDER_PATH" -type f | sort | while read -r FILE; do
+                    if [[ "$FILE" == *".!qB"* || "$FILE" == *".part"* ]]; then continue; fi
+                    FILENAME=$(basename "$FILE")
+                    echo "📤 Uploading: $FILENAME..."
+                    
+                    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                        -H "Authorization: Bearer $FILEMIRAGE_API_TOKEN" \
+                        -F "file=@$FILE;filename=$FILENAME" \
+                        "$SERVER/upload.php")
+                    
+                    if [ "$HTTP_STATUS" -eq 250 ] || [ "$HTTP_STATUS" -eq 200 ] || [ "$HTTP_STATUS" -eq 201 ]; then
+                        echo "✅ Successfully uploaded: $FILENAME"
+                    else
+                        echo "❌ Failed to upload $FILENAME (HTTP Status: $HTTP_STATUS)"
+                        exit 1
+                    fi
+                done
+
+    trigger_map:
+      - push_branch: jj
+        workflow: primary
+      - webhook: {}
+        workflow: primary
